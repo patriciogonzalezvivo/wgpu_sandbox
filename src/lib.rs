@@ -1,4 +1,5 @@
 use tracing::{error, info, warn};
+use std::time;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 use wgpu::{include_wgsl, util::DeviceExt};
@@ -7,6 +8,7 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
+use glam::{Vec2};
 
 mod texture;
 
@@ -15,6 +17,14 @@ mod texture;
 struct Vertex {
     position: [f32; 3],
     tex_coords: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct Uniforms {
+    pub resolution: Vec2,
+    pub time: f32,
+    pub _pad1: f32,
 }
 
 impl Vertex {
@@ -52,11 +62,15 @@ struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
+    start_time: time::Instant,
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer, 
     num_indices: u32,
     diffuse_bind_group: wgpu::BindGroup,
+    uniforms: Uniforms,
+    uniforms_buffer: wgpu::Buffer,
+    uniforms_bind_group: wgpu::BindGroup,
 }
 
 impl State {
@@ -97,6 +111,8 @@ impl State {
                 None, // Trace path
             ).await.unwrap();
 
+            let start_time = time::Instant::now();
+
             let vertex_buffer = device.create_buffer_init(
                 &wgpu::util::BufferInitDescriptor {
                     label: Some("Vertex Buffer"),
@@ -112,8 +128,8 @@ impl State {
                 }
             );
             let num_indices = INDICES.len() as u32;
-            
-            
+
+            // ADD texture
             let diffuse_bytes = include_bytes!("../assets/danny.png");
             let diffuse_texture = texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "danny.png").unwrap(); // CHANGED!
 
@@ -141,7 +157,7 @@ impl State {
                     ],
                     label: Some("texture_bind_group_layout"),
                 });
-    
+
             let diffuse_bind_group = device.create_bind_group(
                 &wgpu::BindGroupDescriptor {
                     layout: &texture_bind_group_layout,
@@ -159,6 +175,42 @@ impl State {
                 }
             );
 
+            // ADD other uniforms
+            let uniforms = Uniforms {
+                resolution: Vec2::ZERO,
+                time: 0.0,
+                _pad1: 0.0,
+            };
+    
+            let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+    
+            let uniforms_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("Uniforms Bind Group Layout"),
+            });
+    
+            let uniforms_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &uniforms_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniforms_buffer.as_entire_binding(),
+                }],
+                label: Some("Uniforms Bind Group"),
+            });
+
         let shader = device.create_shader_module(
             include_wgsl!("shader.wgsl"),
         );
@@ -167,7 +219,7 @@ impl State {
             .create_pipeline_layout(
                 &wgpu::PipelineLayoutDescriptor {
                     label: Some("Render Pipeline Layout"),
-                    bind_group_layouts: &[&texture_bind_group_layout],
+                    bind_group_layouts: &[&texture_bind_group_layout, &uniforms_bind_group_layout],
                     push_constant_ranges: &[],
                 },
             );
@@ -229,11 +281,15 @@ impl State {
             queue,
             config,
             size,
+            start_time,
             render_pipeline,
             vertex_buffer,
             index_buffer,
             num_indices,
             diffuse_bind_group,
+            uniforms,
+            uniforms_buffer,
+            uniforms_bind_group,
         }
     }
 
@@ -245,12 +301,11 @@ impl State {
             self.size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
-            self.surface
-                .configure(&self.device, &self.config);
+            self.surface.configure(&self.device, &self.config);
         }
     }
 
-    fn input(&mut self, event: &WindowEvent) -> bool {
+    fn input(&mut self, _event: &WindowEvent) -> bool {
         false
     }
 
@@ -294,16 +349,20 @@ impl State {
                 },
             );
 
+            self.uniforms.resolution = Vec2::new(self.size.width as f32, self.size.height as f32);
+            self.uniforms.time = self.start_time.elapsed().as_secs_f32();
+            self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::cast_slice(&[self.uniforms]));
+
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]); 
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]); 
+            render_pass.set_bind_group(1, &self.uniforms_bind_group, &[]); 
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16); // 1.
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1); // 2.
         }
 
         // submit will accept anything that implements IntoIter
-        self.queue
-            .submit(std::iter::once(encoder.finish()));
+        self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
         Ok(())
